@@ -1,0 +1,6 @@
+production,new_infected_q05,new_infected_q50,new_infected_q95,new_detected_q05,new_detected_q50,new_detected_q95
+conventional,229.7,251,279.6,242.8,261,292.25
+broiler_2,109.95,124,132.85,123.45,130.5,143.65
+organic,66.45,75.5,91.85,69.9,82.5,91.2
+broiler_1,38.8,43.5,50.55,38.25,47.5,55.85
+layer,30,35.5,42.55,31.45,35,42.85
