@@ -2,32 +2,9 @@
 # HPAI Challenge — Phase 1
 # Q2: Predict temporal + spatial evolution over next 4 weeks
 #
-# Uses YOUR exact SEIDR model structure:
-#  - Spatial (exp kernel) + broiler movements + HRZ + env (CLC water/wetland proximity)
-#  - Activity gating for transmission only (as in your code)
-#  - Preventive culls from prev_culls.csv (as in your code)
-#
-# OUTPUTS (written to: DATA_DIR/Q2_outputs):
-#  1) Raw simulated trajectories (daily) across n_sims:
-#       - Q2_raw_simulated_trajectories_daily.csv
-#         columns: sim, date, newE,newI,newD,newR, S,E,I,D,R
-#  2) Daily forecast summaries (median + 50/90% intervals):
-#       - Q2_summary_daily_quantiles_overall.csv
-#  3) Spatial risk at end of 4 weeks (county-level):
-#       - Q2_spatial_risk_by_county_end_of_4weeks.csv
-#  4) Spatial risk at end of 4 weeks (county x production):
-#       - Q2_spatial_risk_by_county_and_production_end_of_4weeks.csv
-#  5) 4-week totals by production (new infections / new detections; with q05/q50/q95):
-#       - Q2_summary_4week_totals_by_production.csv
-#  6) Figure:
-#       - Q2_forecast_newD_overall.png
-#
-# Notes:
-#  - "Management remains as it is today" implemented by keeping:
-#       activity windows, movement data, preventive culls schedule unchanged.
-#  - Two-stage approach:
-#       (A) Assimilation to last observed confirmation date (force_observed=TRUE)
-#       (B) Forecast 28 days forward from that state (force_observed=FALSE)
+# UPDATED: Parameter inference via pomp (mif2)
+#   - Fit to daily confirmed counts (newD)
+#   - Plug inferred parameters into simulator
 # ============================================================
 
 suppressPackageStartupMessages({
@@ -37,6 +14,7 @@ suppressPackageStartupMessages({
   library(RANN)
   library(ggplot2)
   library(dplyr)
+  library(pomp)
 })
 
 # -----------------------------
@@ -45,12 +23,6 @@ suppressPackageStartupMessages({
 stop_if_missing <- function(df, cols, df_name="data") {
   missing <- setdiff(cols, names(df))
   if (length(missing) > 0) stop(df_name, " missing columns: ", paste(missing, collapse=", "))
-}
-
-pick_existing_file <- function(candidates) {
-  f <- candidates[file.exists(candidates)][1]
-  if (is.na(f) || length(f) == 0) stop("None of these files exist: ", paste(candidates, collapse=", "))
-  f
 }
 
 as_date_safe <- function(x) {
@@ -67,6 +39,24 @@ norm_str <- function(x) {
 qsum_dt <- function(x) {
   qs <- quantile(x, probs = c(0.05, 0.25, 0.50, 0.75, 0.95), na.rm = TRUE)
   data.table(q05=qs[[1]], q25=qs[[2]], q50=qs[[3]], q75=qs[[4]], q95=qs[[5]])
+}
+
+K_exp <- function(d, alpha) exp(-d / alpha)
+g_vol <- function(v) log1p(pmax(v, 0))
+
+make_obs_confirm_ts <- function(cases, start_date, end_date) {
+  dates <- seq.Date(as.Date(start_date), as.Date(end_date), by="day")
+  y <- data.table(date = dates)
+  
+  tmp <- as.data.table(cases)
+  tmp[, date_confirmed := as.Date(date_confirmed)]
+  tmp <- tmp[date_confirmed >= min(dates) & date_confirmed <= max(dates)]
+  tmp <- tmp[, .(y = uniqueN(farm_id)), by = date_confirmed]
+  setnames(tmp, "date_confirmed", "date")
+  
+  y <- merge(y, tmp, by="date", all.x=TRUE)
+  y[is.na(y), y := 0L]
+  y[]
 }
 
 # -----------------------------
@@ -88,55 +78,46 @@ geo_files <- list(
   counties = "counties_32626.geojson"
 )
 
-# Read CSV
 pop   <- fread(file.path(DATA_DIR, csv_files$pop))
 cases <- fread(file.path(DATA_DIR, csv_files$cases))
 act   <- fread(file.path(DATA_DIR, csv_files$act))
 prev  <- fread(file.path(DATA_DIR, csv_files$prev))
 mov   <- fread(file.path(DATA_DIR, csv_files$mov))
 
-# Read GeoJSON
 hrz_file      <- st_read(file.path(DATA_DIR, geo_files$hrz), quiet = TRUE)
 clc_file      <- st_read(file.path(DATA_DIR, geo_files$clc), quiet = TRUE)
 counties_file <- st_read(file.path(DATA_DIR, geo_files$counties), quiet = TRUE)
 
-# Output dir
 OUT_Q2 <- file.path(DATA_DIR, "Q2_outputs")
 dir.create(OUT_Q2, showWarnings = FALSE, recursive = TRUE)
 
 # -----------------------------
 # 2) Parse/standardize columns
 # -----------------------------
-# population.csv
 stop_if_missing(pop, c("farm_id","x","y","production"), "population.csv")
 pop[, farm_id := as.character(farm_id)]
 pop[, production := norm_str(production)]
 
-# Optional capacity field (size scaling)
 cap_col <- NULL
 for (cc in c("capacity","cap","c_i","Capacity","CAPACITY")) {
   if (cc %in% names(pop)) { cap_col <- cc; break }
 }
 
-# cases.csv
 stop_if_missing(cases, c("farm_id","date_confirmed"), "cases.csv")
 cases[, farm_id := as.character(farm_id)]
 date_cols_cases <- intersect(c("date_suspicious","date_confirmed","cull_start","cull_end"), names(cases))
 for (cc in date_cols_cases) cases[[cc]] <- as_date_safe(cases[[cc]])
 
-# activity.csv
 stop_if_missing(act, c("farm_id","date_start","date_end"), "activity.csv")
 act[, farm_id := as.character(farm_id)]
 act[, date_start := as_date_safe(date_start)]
 act[, date_end   := as_date_safe(date_end)]
 
-# prev_culls.csv
 stop_if_missing(prev, c("farm_id","cull_start"), "prev_culls.csv")
 prev[, farm_id := as.character(farm_id)]
 prev[, cull_start := as_date_safe(cull_start)]
 if ("cull_end" %in% names(prev)) prev[, cull_end := as_date_safe(cull_end)]
 
-# movements.csv  (BUGFIX: df_name should be string, not mov_file)
 stop_if_missing(mov, c("date","source_farm","dest_farm","volume"), "movement.csv")
 mov[, date := as_date_safe(date)]
 mov[, source_farm := as.character(source_farm)]
@@ -154,7 +135,7 @@ id_to_idx <- setNames(seq_len(N), farm_ids)
 coords <- as.matrix(pop[, .(x,y)])
 pop_sf <- st_as_sf(pop, coords = c("x","y"), crs = 32626, remove = FALSE)
 
-# Size scaling w_size (optional)
+# Size scaling w_size
 if (!is.null(cap_col)) {
   cap <- suppressWarnings(as.numeric(pop[[cap_col]]))
   ok <- is.finite(cap) & cap > 0
@@ -180,7 +161,6 @@ pop$H_i <- as.integer(lengths(st_intersects(pop_sf, hrz_sf)) > 0)
 # -----------------------------
 clc <- clc_file
 if (!is.na(st_crs(clc)$epsg) && st_crs(clc)$epsg != 32626) clc <- st_transform(clc, 32626)
-
 stop_if_missing(st_drop_geometry(clc), c("CODE_12"), "clc_32626.geojson")
 clc$CODE_12 <- suppressWarnings(as.integer(as.character(clc$CODE_12)))
 
@@ -217,7 +197,6 @@ is_active_on <- function(fid, t) {
   if (is.null(w)) return(FALSE)
   any(t >= w$date_start & t <= w$date_end)
 }
-
 active_vec_on <- function(t, farm_ids) {
   as.integer(vapply(farm_ids, function(fid) is_active_on(fid, t), logical(1)))
 }
@@ -235,7 +214,7 @@ prev[, idx := id_to_idx[farm_id]]
 prev_by_date <- split(prev, by = "cull_start", keep.by = FALSE)
 
 # -----------------------------
-# 9) Spatial neighbor lists (radius search) with aligned idx/dist
+# 9) Spatial neighbor lists (radius search)
 # -----------------------------
 spatial_cutoff_m <- 50000
 nn <- nn2(data = coords, query = coords, searchtype = "radius", radius = spatial_cutoff_m)
@@ -250,37 +229,22 @@ for (i in seq_len(N)) {
   neighbor_dist[[i]] <- dst[keep]
 }
 
-K_exp <- function(d, alpha) exp(-d / alpha)
-g_vol <- function(v) log1p(pmax(v, 0))
-
-# -----------------------------
-# 10) SEIDR Simulator (YOUR model + minimal additions for Q2)
-#     Add init_state + farm-level flags for spatial risk
-# -----------------------------
-# ============================================================
-# Precompute neighbor edge list (run ONCE, outside simulate)
-# ============================================================
-N <- length(farm_ids)
-
-edge_i <- rep.int(seq_len(N), lengths(neighbor_idx))          # target i repeated
-edge_j <- unlist(neighbor_idx,  use.names = FALSE)            # source j
-edge_d <- unlist(neighbor_dist, use.names = FALSE)            # distance d_ij
-edge_w <- w_size[edge_j]                                      # w_size of source j
-
+edge_i <- rep.int(seq_len(N), lengths(neighbor_idx))
+edge_j <- unlist(neighbor_idx,  use.names = FALSE)
+edge_d <- unlist(neighbor_dist, use.names = FALSE)
+edge_w <- w_size[edge_j]
 stopifnot(length(edge_i) == length(edge_j),
           length(edge_j) == length(edge_d),
           length(edge_d) == length(edge_w))
 
-
-
-
+# -----------------------------
+# 10) SEIDR Simulator (your code)
+# -----------------------------
 simulate_seidr <- function(start_date, end_date,
                            pop, farm_ids, id_to_idx,
                            mov_by_date, prev_by_date,
-                           # neighbor_idx, neighbor_dist,  # not needed anymore inside
                            w_size,
                            params,
-                           # NEW: edge list inputs
                            edge_i, edge_j, edge_d, edge_w,
                            seed_farms = character(0),
                            init_state = NULL,
@@ -294,7 +258,6 @@ simulate_seidr <- function(start_date, end_date,
   TT <- length(dates)
   N <- length(farm_ids)
   
-  # State codes: 1=S, 2=E, 3=I, 4=D, 5=R
   S <- 1L; E <- 2L; I <- 3L; D <- 4L; R <- 5L
   
   if (!is.null(init_state)) {
@@ -337,7 +300,6 @@ simulate_seidr <- function(start_date, end_date,
   gate_detection_by_activity   <- isTRUE(params$gate_detection_by_activity)
   gate_removal_by_activity     <- isTRUE(params$gate_removal_by_activity)
   
-  # small speed: compute once
   is_b2 <- (pop$production == "broiler_2")
   
   out <- data.table(
@@ -346,7 +308,6 @@ simulate_seidr <- function(start_date, end_date,
     S = integer(TT), E = integer(TT), I = integer(TT), D = integer(TT), R = integer(TT)
   )
   
-  # reuse vectors (less allocation)
   inf_w  <- numeric(N)
   lambda <- numeric(N)
   
@@ -364,35 +325,24 @@ simulate_seidr <- function(start_date, end_date,
     if (L_mv > 1) mv_queue <- c(list(mv_today), mv_queue[1:(L_mv-1)]) else mv_queue <- list(mv_today)
     mv_recent <- rbindlist(mv_queue, use.names = TRUE, fill = TRUE)
     
-    # inf_w (reuse)
     inf_w[] <- 0.0
     inf_w[X == I] <- 1.0
     inf_w[X == D] <- params$eta
     inf_w[A == 0L] <- 0.0
     
-    # baseline hazard (reuse)
     lambda[] <- params$beta_hrz * pop$H_i + params$beta_env * pop$Z_i
     
-    # -----------------------------
-    # Neighbor transmission (FAST)
-    # -----------------------------
     iw_edge <- inf_w[edge_j]
     if (any(iw_edge > 0)) {
       k_edge <- K_exp(edge_d, params$alpha)
       edge_contrib <- iw_edge * edge_w * k_edge
-      
       rs <- rowsum(edge_contrib, edge_i, reorder = FALSE)
       nb_sum <- numeric(N)
       nb_sum[as.integer(rownames(rs))] <- rs[, 1]
-      
       lambda <- lambda + params$beta_sp * nb_sum
     }
     
-    # -----------------------------
-    # Movement transmission (unchanged logic, but is_b2 precomputed)
-    # -----------------------------
     sus_idx <- which(X == S & A == 1L)
-    
     if (nrow(mv_recent) > 0 && length(sus_idx) > 0) {
       mv2 <- mv_recent[dst_idx %in% sus_idx]
       if (nrow(mv2) > 0) {
@@ -409,7 +359,6 @@ simulate_seidr <- function(start_date, end_date,
       }
     }
     
-    # S->E
     p_inf <- 1 - exp(-pmax(lambda, 0))
     newE_vec <- rbinom(N, 1, p_inf)
     newE_vec[!(X == S & A == 1L)] <- 0L
@@ -419,12 +368,10 @@ simulate_seidr <- function(start_date, end_date,
       X[idxE] <- E
     }
     
-    # E->I
     newI_vec <- rbinom(N, 1, p_EI)
     if (gate_progression_by_activity) newI_vec[!(X == E & A == 1L)] <- 0L else newI_vec[X != E] <- 0L
     X[newI_vec == 1L] <- I
     
-    # I->D
     newD_vec <- integer(N)
     if (force_observed) {
       forceD <- which(!is.na(forced_confirm) & forced_confirm == t)
@@ -438,7 +385,6 @@ simulate_seidr <- function(start_date, end_date,
     } else {
       cand <- which(X == I)
     }
-    
     if (gate_detection_by_activity) cand <- cand[A[cand] == 1L]
     if (length(cand) > 0) {
       det <- rbinom(length(cand), 1, p_ID)
@@ -450,7 +396,6 @@ simulate_seidr <- function(start_date, end_date,
       }
     }
     
-    # D->R
     newR_vec <- integer(N)
     if (force_observed) {
       forceR <- which(!is.na(forced_cull) & forced_cull == t)
@@ -463,7 +408,6 @@ simulate_seidr <- function(start_date, end_date,
     } else {
       candR <- which(X == D)
     }
-    
     if (gate_removal_by_activity) candR <- candR[A[candR] == 1L]
     if (length(candR) > 0) {
       rem <- rbinom(length(candR), 1, p_DR)
@@ -528,129 +472,304 @@ conf_dates <- conf_dates[!is.na(conf_dates)]
 if (length(conf_dates) == 0) stop("cases.csv has no non-NA date_confirmed; cannot define simulation window.")
 
 start_sim <- min(conf_dates)
-today     <- max(conf_dates)   # "as it is today" = last observed confirmation date in dataset
+today     <- max(conf_dates)
 end_fc    <- today + 28
 
-# -----------------------------
-# 14) OPTIONAL: Grid-search calibration (SSE vs observed confirmations)
-#     Turn on/off here
-# -----------------------------
-do_grid_search <- F
+# ============================================================
+# 14) POMP PARAMETER INFERENCE (mif2) — UPDATED (robust across pomp versions)
+#   Key points:
+#   - Some pomp versions pass state/time/params via ...
+#   - Some pass params as scalars (beta_sp=..., etc.) instead of a vector
+#   - We reconstruct params from a template (p_pomp_template)
+# ============================================================
 
-if (do_grid_search) {
+# ============================================================
+# 14) POMP PARAMETER INFERENCE (mif2) — EDITED PORTION (FULL)
+#   Fixes:
+#   1) Robust state/time/params passing across pomp versions
+#   2) Correct scale handling using partrans(fromEst) (NO more NaN / log-scale confusion)
+#   3) Guardrails: never overwrite forecast params with NaN/Inf/non-positive
+#   4) Smaller RW steps for stability with small Np
+# ============================================================
+
+do_pomp_inference <- TRUE
+
+train_start <- max(start_sim, today - 60)
+train_end   <- today
+
+Np_mif <- 100
+Nmif   <- 25
+Np_pf  <- 100
+
+infer_set <- c("beta_sp","beta_mv","beta_hrz","beta_env","alpha")
+
+obs_ts <- make_obs_confirm_ts(cases, train_start, train_end)
+
+# inference approximation: use L_mv = 1
+L_mv_infer <- 1L
+
+make_statenames <- function(N, Lmv) c(paste0("X", seq_len(N)), "newD", paste0("mvq", seq_len(Lmv)))
+
+# measurement model
+rmeas <- function(newD, ...) rpois(1, lambda = pmax(newD, 1e-12))
+dmeas <- function(y, newD, ..., log) dpois(y, lambda = pmax(newD, 1e-12), log = log)
+
+if (do_pomp_inference) {
   
-  # ----------------------------------------
-  # 1) Build observed series + last-21-day window
-  # ----------------------------------------
-  obs_full <- cases[!is.na(date_confirmed), .N, by = date_confirmed][order(date_confirmed)]
-  setnames(obs_full, "date_confirmed", "date")
-  obs_full[, date := as.Date(date)]
+  cat("\n=== POMP inference window:", as.character(train_start), "to", as.character(train_end), "===\n")
   
-  end_date_cal   <- max(obs_full$date)
-  start_date_cal <- end_date_cal - 21L
-  
-  # keep only last 21 days (inclusive)
-  obs <- obs_full[date >= start_date_cal & date <= end_date_cal]
-  
-  cat("Calibration window:", as.character(start_date_cal), "to", as.character(end_date_cal),
-      " (", nrow(obs), " observed days)\n", sep = "")
-  
-  # fixed daily grid for fast scoring
-  all_dates <- seq(start_date_cal, end_date_cal, by = "day")
-  obs_vec <- integer(length(all_dates))
-  obs_vec[match(obs$date, all_dates)] <- obs$N
-  
-  # ----------------------------------------
-  # 2) Fast scoring (NO merge)
-  # ----------------------------------------
-  score_run_fast <- function(sim_out) {
-    df <- sim_out$out_daily[, .(date = as.Date(date), pred = newD)]
-    
-    pred_vec <- numeric(length(all_dates))
-    ii <- match(df$date, all_dates)
-    ok <- !is.na(ii)
-    pred_vec[ii[ok]] <- df$pred[ok]
-    
-    sum((obs_vec - pred_vec)^2)
-  }
-  
-  # ----------------------------------------
-  # 3) Grid definition
-  # ----------------------------------------
-  grid <- CJ(
-    beta_sp  = c(0.04, 0.08, 0.12),
-    alpha    = c(8000, 12000, 20000),
-    beta_mv  = c(0.10, 0.20, 0.30),
-    beta_hrz = c(0.001, 0.002, 0.004),
-    beta_env = c(0.0005, 0.0010, 0.0020)
+  obs_df <- data.frame(
+    time = as.numeric(obs_ts$date),  # days since 1970-01-01
+    y    = obs_ts$y
   )
-  grid[, score := NA_real_]
   
-  n_sims_per_point <- 10
+  # NATURAL-SCALE template params (also used for reconstruction inside step)
+  p_pomp_template <- c(
+    beta_sp  = params$beta_sp,
+    beta_mv  = params$beta_mv,
+    beta_hrz = params$beta_hrz,
+    beta_env = params$beta_env,
+    alpha    = params$alpha,
+    eta      = params$eta,
+    L_latent     = params$L_latent,
+    L_inf_to_det = params$L_inf_to_det,
+    L_det_to_rem = params$L_det_to_rem,
+    L_mv = L_mv_infer
+  )
   
-  # ----------------------------------------
-  # 4) Grid search loop (short window => faster)
-  # ----------------------------------------
-  for (k in seq_len(nrow(grid))) {
+  # ensure strictly positive where required (important for log transform stability)
+  pos_names <- c("beta_sp","beta_mv","beta_hrz","beta_env","alpha")
+  p_pomp_template[pos_names] <- pmax(p_pomp_template[pos_names], 1e-6)
+  
+  # rinit: all S, seed E
+  rinit_seidr <- function(params, t0, ...) {
+    X <- rep.int(1L, N)
+    seed_idx <- id_to_idx[as.character(seed)]
+    seed_idx <- seed_idx[!is.na(seed_idx)]
+    if (length(seed_idx) > 0) X[seed_idx] <- 2L
+    c(
+      setNames(as.numeric(X), paste0("X", seq_len(N))),
+      newD = 0,
+      setNames(rep(0.0, L_mv_infer), paste0("mvq", seq_len(L_mv_infer)))
+    )
+  }
+  
+  # robust step.fun: recovers x/t/params from ... across pomp versions
+  step_seidr <- function(x = NULL, t = NULL, params = NULL, ...) {
     
-    params_k <- params
-    params_k$beta_sp  <- grid$beta_sp[k]
-    params_k$alpha    <- grid$alpha[k]
-    params_k$beta_mv  <- grid$beta_mv[k]
-    params_k$beta_hrz <- grid$beta_hrz[k]
-    params_k$beta_env <- grid$beta_env[k]
+    dots <- list(...)
     
-    scores <- numeric(n_sims_per_point)
+    # ---- recover state ----
+    if (is.null(x)) {
+      if (!is.null(dots$state))       x <- dots$state
+      else if (!is.null(dots$states)) x <- dots$states
+      else if (length(dots) >= 1 && is.numeric(dots[[1]])) x <- dots[[1]]
+    }
+    if (is.null(x)) stop("step_seidr: could not find state vector (x/state/states/first unnamed arg).")
     
-    for (r in seq_len(n_sims_per_point)) {
-      
-      sim_k <- simulate_seidr(
-        start_date = start_date_cal,
-        end_date   = end_date_cal,
-        pop = pop, farm_ids = farm_ids, id_to_idx = id_to_idx,
-        mov_by_date = mov_by_date, prev_by_date = prev_by_date,
-        w_size = w_size,
-        params = params_k,
-        edge_i = edge_i, edge_j = edge_j, edge_d = edge_d, edge_w = edge_w,
-        seed_farms = seed,
-        init_state = NULL,
-        force_observed = FALSE,
-        rng_seed = 1000 + 100*k + r
-      )
-      
-      scores[r] <- score_run_fast(sim_k)
+    # ---- recover time ----
+    if (is.null(t)) {
+      if (!is.null(dots$time)) t <- dots$time
+      else if (length(dots) >= 2 && is.numeric(dots[[2]])) t <- dots[[2]]
+    }
+    if (is.null(t)) stop("step_seidr: could not find time (t/time).")
+    
+    # ---- recover params ----
+    if (is.null(params)) {
+      if (!is.null(dots$params) && is.numeric(dots$params)) {
+        params <- dots$params
+      } else if (!is.null(dots$parms) && is.numeric(dots$parms)) {
+        params <- dots$parms
+      } else {
+        # reconstruct from scalars in ...
+        params <- p_pomp_template
+        for (nm in names(params)) {
+          if (!is.null(dots[[nm]])) params[[nm]] <- dots[[nm]]
+        }
+      }
+    }
+    if (is.null(params)) stop("step_seidr: params missing (could not reconstruct).")
+    
+    # ensure named numeric vector
+    params <- as.numeric(params)
+    if (is.null(names(params))) names(params) <- names(p_pomp_template)
+    for (nm in names(p_pomp_template)) if (!(nm %in% names(params))) params[nm] <- p_pomp_template[[nm]]
+    
+    # ---- unpack ----
+    x <- as.numeric(x)
+    X <- as.integer(x[1:N])
+    day <- as.Date(t, origin = "1970-01-01")
+    
+    # activity
+    A <- active_vec_on(day, farm_ids)
+    
+    # preventive culls
+    pv <- prev_by_date[[as.character(day)]]
+    if (!is.null(pv) && nrow(pv) > 0) X[pv$idx] <- 5L
+    
+    # infectiousness
+    inf_w <- numeric(N)
+    inf_w[X == 3L] <- 1.0
+    inf_w[X == 4L] <- params[["eta"]]
+    inf_w[A == 0L] <- 0.0
+    
+    # background FOI
+    lambda <- params[["beta_hrz"]] * pop$H_i + params[["beta_env"]] * pop$Z_i
+    
+    # spatial FOI
+    iw_edge <- inf_w[edge_j]
+    if (any(iw_edge > 0)) {
+      k_edge <- K_exp(edge_d, params[["alpha"]])
+      edge_contrib <- iw_edge * edge_w * k_edge
+      rs <- rowsum(edge_contrib, edge_i, reorder = FALSE)
+      nb_sum <- numeric(N)
+      nb_sum[as.integer(rownames(rs))] <- rs[, 1]
+      lambda <- lambda + params[["beta_sp"]] * nb_sum
     }
     
-    grid$score[k] <- mean(scores)
+    # movement FOI (L_mv_infer = 1)
+    is_b2 <- (pop$production == "broiler_2")
+    mv_today <- mov_by_date[[as.character(day)]]
+    if (is.null(mv_today)) mv_today <- data.table(src_idx=integer(), dst_idx=integer(), volume=numeric())
     
-    if (k %% 10 == 0) {
-      cat(sprintf("Grid %d / %d (%.1f%%)\n", k, nrow(grid), 100*k/nrow(grid)))
+    if (nrow(mv_today) > 0) {
+      sus_idx <- which(X == 1L & A == 1L)
+      if (length(sus_idx) > 0) {
+        mv2 <- mv_today[dst_idx %in% sus_idx]
+        if (nrow(mv2) > 0) {
+          mv2[, src_inf := inf_w[src_idx]]
+          mv2 <- mv2[src_inf > 0]
+          if (nrow(mv2) > 0) {
+            mv2 <- mv2[is_b2[dst_idx]]
+            if (nrow(mv2) > 0) {
+              mv2[, contrib := g_vol(volume) * src_inf]
+              mv_sum <- mv2[, .(mv_contrib = sum(contrib)), by = dst_idx]
+              lambda[mv_sum$dst_idx] <- lambda[mv_sum$dst_idx] + params[["beta_mv"]] * mv_sum$mv_contrib
+            }
+          }
+        }
+      }
+    }
+    
+    # transitions
+    p_inf <- 1 - exp(-pmax(lambda, 0))
+    
+    newE <- rbinom(N, 1, p_inf)
+    newE[!(X == 1L & A == 1L)] <- 0L
+    X[newE == 1L] <- 2L
+    
+    p_EI <- 1 / params[["L_latent"]]
+    p_ID <- 1 / params[["L_inf_to_det"]]
+    p_DR <- 1 / params[["L_det_to_rem"]]
+    
+    newI <- rbinom(N, 1, p_EI); newI[X != 2L] <- 0L
+    X[newI == 1L] <- 3L
+    
+    newD_ind <- rbinom(N, 1, p_ID); newD_ind[X != 3L] <- 0L
+    X[newD_ind == 1L] <- 4L
+    
+    newR <- rbinom(N, 1, p_DR); newR[X != 4L] <- 0L
+    X[newR == 1L] <- 5L
+    
+    # return in statenames order
+    c(
+      setNames(as.numeric(X), paste0("X", seq_len(N))),
+      newD = as.numeric(sum(newD_ind)),
+      mvq1 = 0.0
+    )
+  }
+  
+  # parameter transforms (mif2/pfilter use ESTIMATION scale internally)
+  trans <- parameter_trans(
+    log = c("beta_sp","beta_mv","beta_hrz","beta_env","alpha")
+  )
+  
+  pobj <- pomp(
+    data = obs_df,
+    times = "time",
+    t0 = as.numeric(train_start) - 1,
+    rprocess = discrete_time(step.fun = step_seidr, delta.t = 1),
+    rinit = rinit_seidr,
+    rmeasure = rmeas,
+    dmeasure = dmeas,
+    statenames = make_statenames(N, L_mv_infer),
+    paramnames = names(p_pomp_template),
+    partrans = trans
+  )
+  pobj <- pomp(pobj, params = p_pomp_template)
+  
+  # start point on estimation scale
+  start_est <- coef(pobj, transform = TRUE)
+  
+  # sanity check: all inferred params must be finite on estimation scale
+  if (any(!is.finite(start_est[infer_set]))) {
+    bad <- names(start_est[infer_set])[!is.finite(start_est[infer_set])]
+    stop("Non-finite start_est for: ", paste(bad, collapse = ", "))
+  }
+  
+  # RW sds on estimation scale (smaller steps for stability with small Np)
+  rw_vec <- setNames(rep(0, length(start_est)), names(start_est))
+  rw_vec[infer_set] <- 0.02
+  if ("alpha" %in% infer_set) rw_vec["alpha"] <- 0.01
+  
+  rw <- do.call(get("rw_sd", envir = asNamespace("pomp")), as.list(rw_vec))
+  
+  cat("Running mif2... (Np=", Np_mif, ", Nmif=", Nmif, ")\n", sep="")
+  
+  mif_fit <- mif2(
+    pobj,
+    params = start_est,   # estimation scale
+    Np = Np_mif,
+    Nmif = Nmif,
+    rw.sd = rw,
+    cooling.type = "geometric",
+    cooling.fraction.50 = 0.5
+  )
+  
+  # ---- Extract results safely ----
+  # estimation-scale params (what mif2 optimizes)
+  p_hat_est <- coef(mif_fit)
+  
+  # convert estimation -> natural using partrans (robust across pomp versions)
+  p_hat_nat <- pomp::partrans(pobj, p_hat_est, dir = "fromEst")
+  
+  cat("\nInferred params (natural scale, via partrans):\n")
+  print(p_hat_nat[infer_set])
+  
+  # Likelihood check: pass estimation-scale params consistently
+  cat("\nRunning pfilter for logLik check (Np=", Np_pf, ")...\n", sep="")
+  pf <- pfilter(pobj, params = p_hat_est, Np = Np_pf)
+  cat("logLik(pfilter) =", as.numeric(logLik(pf)), "\n")
+  
+  # Guardrails: don't overwrite with NaN/Inf/non-positive
+  for (nm in infer_set) {
+    if (!is.finite(p_hat_nat[[nm]]) || p_hat_nat[[nm]] <= 0) {
+      message("WARNING: inferred ", nm, " not finite/positive; keeping baseline.")
+      p_hat_nat[[nm]] <- p_pomp_template[[nm]]
     }
   }
   
-  # ----------------------------------------
-  # 5) Pick best + set params
-  # ----------------------------------------
-  best <- grid[order(score)][1:10]
-  print(best)
+  # Update forecast params (restore original L_mv for simulator; keep inferred betas/alpha)
+  params$beta_sp  <- as.numeric(p_hat_nat["beta_sp"])
+  params$beta_mv  <- as.numeric(p_hat_nat["beta_mv"])
+  params$beta_hrz <- as.numeric(p_hat_nat["beta_hrz"])
+  params$beta_env <- as.numeric(p_hat_nat["beta_env"])
+  params$alpha    <- as.numeric(p_hat_nat["alpha"])
   
-  if (nrow(best) >= 1) {
-    params$beta_sp  <- best$beta_sp[1]
-    params$alpha    <- best$alpha[1]
-    params$beta_mv  <- best$beta_mv[1]
-    params$beta_hrz <- best$beta_hrz[1]
-    params$beta_env <- best$beta_env[1]
-    cat("Using calibrated params from best grid row (last-21-day fit).\n")
-  }
+  cat("\nUpdated forecast params:\n")
+  print(params[c("beta_sp","beta_mv","beta_hrz","beta_env","alpha","eta","L_mv")])
 }
+# ------------------------------------------------------------
+# (Your next steps)
+# - Run simulate_seidr(start_sim, today, ...) if you want to align to current state
+# - Then simulate forward from today+1 to end_fc for ensembles
+# ------------------------------------------------------------
+# ============================================================
+# 15) Q2 Ensemble Forecast (your original two-stage approach)
+# ============================================================
 
-
-# -----------------------------
-# 15) Q2 Ensemble Forecast (two-stage per replicate)
-# -----------------------------
 run_one_q2 <- function(sim_id, rng_seed) {
   
-  # A) Assimilation: start_sim -> today, force observed
   assim <- simulate_seidr(
     start_date = start_sim,
     end_date   = today,
@@ -658,7 +777,7 @@ run_one_q2 <- function(sim_id, rng_seed) {
     mov_by_date = mov_by_date, prev_by_date = prev_by_date,
     w_size = w_size,
     params = params,
-    edge_i = edge_i, edge_j = edge_j, edge_d = edge_d, edge_w = edge_w,  # <-- add
+    edge_i = edge_i, edge_j = edge_j, edge_d = edge_d, edge_w = edge_w,
     seed_farms = seed,
     init_state = NULL,
     force_observed = TRUE,
@@ -668,7 +787,6 @@ run_one_q2 <- function(sim_id, rng_seed) {
   
   init_state <- assim$final_state
   
-  # B) Forecast: today+1 -> today+28, no forcing
   fc <- simulate_seidr(
     start_date = today + 1,
     end_date   = end_fc,
@@ -676,7 +794,7 @@ run_one_q2 <- function(sim_id, rng_seed) {
     mov_by_date = mov_by_date, prev_by_date = prev_by_date,
     w_size = w_size,
     params = params,
-    edge_i = edge_i, edge_j = edge_j, edge_d = edge_d, edge_w = edge_w,  # <-- add
+    edge_i = edge_i, edge_j = edge_j, edge_d = edge_d, edge_w = edge_w,
     seed_farms = character(0),
     init_state = init_state,
     force_observed = FALSE,
@@ -697,21 +815,22 @@ run_one_q2 <- function(sim_id, rng_seed) {
   
   list(traj = fc$out_daily, farmflags = farmflags)
 }
+
 # Choose number of stochastic trajectories
-n_sims <- 10  # raise to 500–1000 if you have time
+n_sims_forecast <- 10  # raise to 500–1000 if time
 set.seed(123)
 
-res <- vector("list", n_sims)
-for (s in seq_len(n_sims)) {
+res <- vector("list", n_sims_forecast)
+for (s in seq_len(n_sims_forecast)) {
   res[[s]] <- run_one_q2(sim_id = s, rng_seed = 10000 + s)
-  if (s %% 25 == 0) cat("Completed", s, "of", n_sims, "\n")
+  if (s %% 25 == 0) cat("Completed", s, "of", n_sims_forecast, "\n")
 }
 
 traj_all <- rbindlist(lapply(res, `[[`, "traj"))
 farmflags_all <- rbindlist(lapply(res, `[[`, "farmflags"))
 
 # -----------------------------
-# 16) Save RAW trajectories (requested)
+# 16) Save RAW trajectories
 # -----------------------------
 fwrite(traj_all, file.path(OUT_Q2, "Q2_raw_simulated_trajectories_daily.csv"))
 fwrite(farmflags_all, file.path(OUT_Q2, "Q2_raw_farmflags_new_events.csv"))
@@ -720,8 +839,6 @@ fwrite(farmflags_all, file.path(OUT_Q2, "Q2_raw_farmflags_new_events.csv"))
 # 17) Temporal summary: daily quantiles (overall)
 # -----------------------------
 sum_daily <- traj_all[, c(qsum_dt(newE), qsum_dt(newD), qsum_dt(newR)), by = date]
-
-# sum_daily should be: date + 15 quantile columns
 stopifnot(ncol(sum_daily) == 16)
 
 new_names <- c(
@@ -730,16 +847,13 @@ new_names <- c(
   "newD_q05","newD_q25","newD_q50","newD_q75","newD_q95",
   "newR_q05","newR_q25","newR_q50","newR_q75","newR_q95"
 )
-
 data.table::setnames(sum_daily, new = new_names)
-
 stopifnot(anyDuplicated(names(sum_daily)) == 0)
 
 fwrite(sum_daily, file.path(OUT_Q2, "Q2_summary_daily_quantiles_overall.csv"))
 
 # -----------------------------
 # 18) By production: 4-week totals with intervals
-#      (count farms that become newly infected/detected over 28 days)
 # -----------------------------
 prod_sim <- farmflags_all[
   , .(
@@ -764,9 +878,8 @@ prod_summary <- prod_sim[
 fwrite(prod_summary, file.path(OUT_Q2, "Q2_summary_4week_totals_by_production.csv"))
 
 # -----------------------------
-# 19) Spatial risk (county): probability of ≥1 new event over 4 weeks
+# 19) Spatial risk (county)
 # -----------------------------
-# Clean county_name to avoid NA groups
 farmflags_all[is.na(county_name) | county_name == "", county_name := "Unknown"]
 
 county_sim <- farmflags_all[
@@ -787,7 +900,6 @@ county_risk <- county_sim[
 
 fwrite(county_risk, file.path(OUT_Q2, "Q2_spatial_risk_by_county_end_of_4weeks.csv"))
 
-# County x production risk
 county_prod_sim <- farmflags_all[
   , .(
     any_new_infected = any(newly_infected, na.rm = TRUE),
@@ -807,7 +919,7 @@ county_prod_risk <- county_prod_sim[
 fwrite(county_prod_risk, file.path(OUT_Q2, "Q2_spatial_risk_by_county_and_production_end_of_4weeks.csv"))
 
 # -----------------------------
-# 20) Quick forecast figure: newD (median + 90% interval)
+# 20) Quick forecast figure: newD
 # -----------------------------
 p_fc_newD <- ggplot(as.data.frame(sum_daily), aes(x = date)) +
   geom_ribbon(aes(ymin = newD_q05, ymax = newD_q95), alpha = 0.25) +
@@ -836,4 +948,3 @@ cat("County risk:      Q2_spatial_risk_by_county_end_of_4weeks.csv\n")
 cat("County+prod risk: Q2_spatial_risk_by_county_and_production_end_of_4weeks.csv\n")
 cat("Figure:           Q2_forecast_newD_overall.png\n")
 cat("========================================\n")
-
