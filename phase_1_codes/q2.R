@@ -817,7 +817,7 @@ run_one_q2 <- function(sim_id, rng_seed) {
 }
 
 # Choose number of stochastic trajectories
-n_sims_forecast <- 10  # raise to 500–1000 if time
+n_sims_forecast <- 100  # raise to 500–1000 if time
 set.seed(123)
 
 res <- vector("list", n_sims_forecast)
@@ -948,3 +948,4 @@ cat("County risk:      Q2_spatial_risk_by_county_end_of_4weeks.csv\n")
 cat("County+prod risk: Q2_spatial_risk_by_county_and_production_end_of_4weeks.csv\n")
 cat("Figure:           Q2_forecast_newD_overall.png\n")
 cat("========================================\n")
+
